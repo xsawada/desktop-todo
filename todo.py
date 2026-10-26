@@ -4,6 +4,7 @@
 第1段階：タスクの追加・一覧表示・完了（削除）
 第2段階：JSONファイルへの保存と、起動時の読み込み
 第3段階：期限の入力、期限が近い順の並べ替え、期限切れ・当日の色分け
+第4段階：登録したタスクの修正（ダブルクリックまたは「編集」ボタン）
 
 実行方法：python todo.py
 （Windowsでは拡張子を .pyw にすると、黒いコンソール画面が出ません）
@@ -90,6 +91,16 @@ def format_deadline(iso_text):
     if d.year != date.today().year:
         label = f"{d.year}/" + label
     return label
+
+
+def deadline_to_input(iso_text):
+    """保存形式（2026-10-31）を、修正画面の入力欄に入れる形（10/31）に変える"""
+    if not iso_text:
+        return ""
+    d = date.fromisoformat(iso_text)
+    if d.year != date.today().year:
+        return f"{d.year}/{d.month}/{d.day}"
+    return f"{d.month}/{d.day}"
 
 
 def sort_key(task):
@@ -246,9 +257,10 @@ class TodoApp:
         self.tree.tag_configure("today", foreground=TODAY_COLOR)
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<Delete>", lambda event: self.complete_task())  # Deleteキーでも完了
+        self.tree.bind("<Double-1>", self.on_double_click)               # ダブルクリックで修正
         scrollbar.config(command=self.tree.yview)
 
-        # --- 下部：完了ボタンと最前面の切り替え ---
+        # --- 下部：完了・編集ボタンと最前面の切り替え ---
         bottom_frame = tk.Frame(self.root, bg=BG_COLOR)
         bottom_frame.pack(fill="x", padx=12, pady=10)
 
@@ -257,6 +269,12 @@ class TodoApp:
             font=self.small_font, fg=TEXT_COLOR, relief="groove",
             padx=8, cursor="hand2",
         ).pack(side="left")
+
+        tk.Button(
+            bottom_frame, text="編集", command=self.edit_task,
+            font=self.small_font, fg=TEXT_COLOR, relief="groove",
+            padx=8, cursor="hand2",
+        ).pack(side="left", padx=(6, 0))
 
         self.topmost_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
@@ -270,42 +288,65 @@ class TodoApp:
         self.status = tk.Label(self.root, anchor="w", fg="gray", font=self.small_font, bg=BG_COLOR)
         self.status.pack(fill="x", padx=12, pady=(0, 10))
 
-    # ---- 操作 ----
-    def add_task(self):
-        text = self.entry.get().strip()
+    # ---- 入力チェック（追加と修正で共通） ----
+    def check_input(self, text, deadline_text, parent, current=None, deadline_widget=None):
+        """
+        タスク名と期限をチェックする。
+        current：修正中のタスク（追加のときは None）
+        戻り値：問題なければ (タスク名, 期限の保存形式 または None)、だめなら None
+        """
+        text = text.strip()
 
-        # タスクの入力チェック
+        # タスク名のチェック
         if not text:
-            messagebox.showwarning("入力エラー", "タスクを入力してください。", parent=self.root)
-            return
+            messagebox.showwarning("入力エラー", "タスクを入力してください。", parent=parent)
+            return None
         if len(text) > MAX_LENGTH:
             messagebox.showwarning(
                 "入力エラー",
                 f"{MAX_LENGTH}文字以内で入力してください。（いま {len(text)} 文字）",
-                parent=self.root,
+                parent=parent,
             )
-            return
+            return None
 
-        # 期限の入力チェック
-        deadline, error = parse_deadline(self.deadline_entry.get())
+        # 期限のチェック
+        deadline, error = parse_deadline(deadline_text)
         if error:
-            messagebox.showwarning("期限の入力エラー", error, parent=self.root)
-            self.deadline_entry.focus_set()
-            return
-        if deadline and deadline < date.today():
+            messagebox.showwarning("期限の入力エラー", error, parent=parent)
+            if deadline_widget:
+                deadline_widget.focus_set()
+            return None
+        deadline_iso = deadline.isoformat() if deadline else None
+
+        # 過ぎた日付の確認（修正で期限を変えていないときは聞かない）
+        unchanged = current is not None and current.get("deadline") == deadline_iso
+        if deadline and deadline < date.today() and not unchanged:
             if not messagebox.askyesno(
                 "確認", f"期限（{deadline.month}/{deadline.day}）はもう過ぎています。\nこのまま登録しますか？",
-                parent=self.root,
+                parent=parent,
             ):
-                return
+                return None
 
-        if any(task["text"] == text for task in self.tasks):
-            if not messagebox.askyesno("確認", f"「{text}」はすでにあります。\nそれでも追加しますか？", parent=self.root):
-                return
+        # 同じタスク名の確認（修正中のタスク自身は除く）
+        if any(task["text"] == text for task in self.tasks if task is not current):
+            if not messagebox.askyesno("確認", f"「{text}」はすでにあります。\nこのまま登録しますか？", parent=parent):
+                return None
+
+        return text, deadline_iso
+
+    # ---- 操作 ----
+    def add_task(self):
+        result = self.check_input(
+            self.entry.get(), self.deadline_entry.get(), self.root,
+            deadline_widget=self.deadline_entry,
+        )
+        if result is None:
+            return
+        text, deadline_iso = result
 
         self.tasks.append({
             "text": text,
-            "deadline": deadline.isoformat() if deadline else None,
+            "deadline": deadline_iso,
             "created": datetime.now().isoformat(timespec="seconds"),
         })
         if self.save():
@@ -326,6 +367,84 @@ class TodoApp:
             self.tasks.insert(index, removed)  # 保存に失敗したら元に戻す
         self.refresh_list()
 
+    def edit_task(self):
+        """選んだタスクの修正画面を開く"""
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("お知らせ", "修正したいタスクを一覧から選んでください。", parent=self.root)
+            return
+        task = self.tasks[int(selected[0])]
+
+        # --- 修正用の小さな窓 ---
+        dialog = tk.Toplevel(self.root)
+        dialog.title("タスクの修正")
+        dialog.configure(bg=BG_COLOR)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)               # 本体の窓の上に出す
+        dialog.attributes("-topmost", True)
+
+        form = tk.Frame(dialog, bg=BG_COLOR)
+        form.pack(padx=16, pady=(16, 4))
+
+        tk.Label(form, text="タスク", font=self.small_font, bg=BG_COLOR, fg=TEXT_COLOR)\
+            .grid(row=0, column=0, sticky="w", pady=4)
+        text_entry = tk.Entry(form, font=self.font, fg=TEXT_COLOR, relief="solid", bd=1, width=24)
+        text_entry.grid(row=0, column=1, pady=4, ipady=3)
+        text_entry.insert(0, task["text"])
+
+        tk.Label(form, text="期限", font=self.small_font, bg=BG_COLOR, fg=TEXT_COLOR)\
+            .grid(row=1, column=0, sticky="w", pady=4)
+        deadline_entry = tk.Entry(form, font=self.font, fg=TEXT_COLOR, relief="solid", bd=1, width=24)
+        deadline_entry.grid(row=1, column=1, pady=4, ipady=3)
+        deadline_entry.insert(0, deadline_to_input(task.get("deadline")))
+
+        tk.Label(
+            dialog, text="期限を空欄にすると「期限なし」になります",
+            font=(FONT_NAME, SMALL_FONT_SIZE - 1), fg="gray", bg=BG_COLOR,
+        ).pack(padx=16, anchor="w")
+
+        def save_edit():
+            result = self.check_input(
+                text_entry.get(), deadline_entry.get(), dialog,
+                current=task, deadline_widget=deadline_entry,
+            )
+            if result is None:
+                return
+            old = (task["text"], task.get("deadline"))
+            task["text"], task["deadline"] = result
+            if not self.save():
+                task["text"], task["deadline"] = old  # 保存に失敗したら元に戻す
+                return
+            dialog.destroy()
+            self.refresh_list(select=task)
+
+        buttons = tk.Frame(dialog, bg=BG_COLOR)
+        buttons.pack(fill="x", padx=16, pady=12)
+        tk.Button(
+            buttons, text="保存", command=save_edit,
+            font=self.small_font, bg=BUTTON_COLOR, fg=BUTTON_TEXT,
+            activebackground=BUTTON_COLOR, activeforeground=BUTTON_TEXT,
+            relief="flat", padx=16, cursor="hand2",
+        ).pack(side="right")
+        tk.Button(
+            buttons, text="キャンセル", command=dialog.destroy,
+            font=self.small_font, fg=TEXT_COLOR, relief="groove", padx=8, cursor="hand2",
+        ).pack(side="right", padx=(0, 8))
+
+        dialog.bind("<Return>", lambda event: save_edit())
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+
+        # 本体の窓の近くに表示し、閉じるまで本体は操作できないようにする
+        dialog.geometry(f"+{self.root.winfo_rootx() + 30}+{self.root.winfo_rooty() + 60}")
+        deadline_entry.focus_set()
+        deadline_entry.select_range(0, tk.END)
+        dialog.grab_set()
+
+    def on_double_click(self, event):
+        """見出しではなく、タスクの行をダブルクリックしたときだけ修正画面を開く"""
+        if self.tree.identify_row(event.y):
+            self.edit_task()
+
     def toggle_topmost(self):
         self.root.attributes("-topmost", self.topmost_var.get())
 
@@ -339,8 +458,11 @@ class TodoApp:
             messagebox.showerror("保存エラー", f"保存できませんでした。\n{e}", parent=self.root)
             return False
 
-    def refresh_list(self):
-        """期限が近い順に並べ替えて、表を描き直す"""
+    def refresh_list(self, select=None):
+        """
+        期限が近い順に並べ替えて、表を描き直す。
+        select：描き直したあとに選んだ状態にするタスク（修正後、並び順が変わっても見失わないように）
+        """
         self.tasks.sort(key=sort_key)
         today = date.today().isoformat()
 
@@ -356,6 +478,9 @@ class TodoApp:
                 tags = ("today",)
             self.tree.insert("", "end", iid=str(i), tags=tags,
                              values=(task["text"], format_deadline(deadline)))
+            if task is select:
+                self.tree.selection_set(str(i))
+                self.tree.see(str(i))
 
         status = f"残り {len(self.tasks)} 件"
         if overdue_count:
