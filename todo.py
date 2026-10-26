@@ -3,15 +3,18 @@
 
 第1段階：タスクの追加・一覧表示・完了（削除）
 第2段階：JSONファイルへの保存と、起動時の読み込み
+第3段階：期限の入力、期限が近い順の並べ替え、期限切れ・当日の色分け
 
 実行方法：python todo.py
 （Windowsでは拡張子を .pyw にすると、黒いコンソール画面が出ません）
 """
 import json
 import os
+import re
+import unicodedata
 import tkinter as tk
-from tkinter import messagebox
-from datetime import datetime
+from tkinter import ttk, messagebox
+from datetime import date, datetime, timedelta
 
 # 保存先：このスクリプトと同じフォルダの tasks.json
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.json")
@@ -25,7 +28,7 @@ MAX_LENGTH = 50
 FONT_NAME = "Meiryo UI"     # 文字の種類（例："Yu Gothic UI", "BIZ UDPGothic"）
 FONT_SIZE = 13              # 一覧・入力欄の文字の大きさ
 SMALL_FONT_SIZE = 11        # ボタン・件数表示の文字の大きさ
-WINDOW_SIZE = "380x500"     # 窓の大きさ（横x縦）
+WINDOW_SIZE = "460x520"     # 窓の大きさ（横x縦）
 
 BG_COLOR = "#FAF7F2"        # 窓の背景色
 LIST_BG = "#FFFFFF"         # 一覧の背景色
@@ -33,6 +36,69 @@ TEXT_COLOR = "#333333"      # 文字の色
 SELECT_COLOR = "#CFE3D4"    # 選んだタスクの色
 BUTTON_COLOR = "#7FA88A"    # 追加ボタンの色
 BUTTON_TEXT = "#FFFFFF"     # 追加ボタンの文字の色
+OVERDUE_COLOR = "#C0392B"   # 期限切れの文字の色
+TODAY_COLOR = "#D35400"     # 今日が期限の文字の色
+
+WEEKDAYS = "月火水木金土日"
+
+
+# ------------------------------------------------------------
+# 期限の読み取り（画面とは切り離しておく）
+# ------------------------------------------------------------
+def parse_deadline(text, today=None):
+    """
+    入力された期限の文字を日付に変換する。
+    受け付ける書き方：10/31, 10-31, 10月31日, 2026/10/31, 2026-10-31, 2026年10月31日
+    （全角数字もOK）
+    戻り値：(date または None, エラーメッセージ または None)
+      空欄なら (None, None) ＝「期限なし」
+    """
+    today = today or date.today()
+    text = unicodedata.normalize("NFKC", text).strip()  # 全角→半角
+    if not text:
+        return None, None
+
+    m = re.fullmatch(r"(?:(\d{4})[/\-年])?(\d{1,2})[/\-月](\d{1,2})日?", text)
+    if not m:
+        return None, "期限は「10/31」や「2026/10/31」の形で入力してください。"
+
+    year_text, month, day = m.group(1), int(m.group(2)), int(m.group(3))
+    year = int(year_text) if year_text else today.year
+
+    try:
+        result = date(year, month, day)
+    except ValueError:
+        return None, f"{month}月{day}日 は存在しない日付です。"
+
+    # 年を省略して、ずっと前の日付になった場合は来年とみなす
+    # （例：12月に「1/10」と入力したら翌年の1月10日）
+    if not year_text and result < today - timedelta(days=90):
+        try:
+            result = date(year + 1, month, day)
+        except ValueError:  # 来年に2/29が無い場合など
+            return None, f"{year + 1}年{month}月{day}日 は存在しない日付です。"
+
+    return result, None
+
+
+def format_deadline(iso_text):
+    """保存形式（2026-10-31）を表示用（10/31(土)）に変える"""
+    if not iso_text:
+        return "―"
+    d = date.fromisoformat(iso_text)
+    label = f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
+    if d.year != date.today().year:
+        label = f"{d.year}/" + label
+    return label
+
+
+def sort_key(task):
+    """
+    並び順：期限のあるものを日付の早い順（期限切れが自然に一番上）
+            → 期限なしは一番下 → 同じ期限なら先に登録した順
+    """
+    deadline = task.get("deadline")
+    return (deadline is None, deadline or "", task.get("created", ""))
 
 
 # ------------------------------------------------------------
@@ -42,6 +108,7 @@ def load_tasks(path):
     """
     ファイルからタスクを読み込む。
     戻り値：(タスクのリスト, 警告メッセージ または None)
+    第2段階までの古いデータ（期限の項目が無い）は「期限なし」として読み込む。
     """
     if not os.path.exists(path):
         return [], None  # 初回起動時はファイルが無いので空で始める
@@ -58,17 +125,31 @@ def load_tasks(path):
     if not isinstance(data, list):
         return [], "保存ファイルの形式が正しくないため、空の状態で始めます。"
 
-    # 形式が正しい行だけを採用し、おかしな行は数を数えておく
     tasks = []
-    skipped = 0
+    skipped = 0        # 読み飛ばしたタスクの数
+    bad_deadline = 0   # 期限が読めず「期限なし」にしたタスクの数
     for item in data:
-        if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
-            tasks.append(item)
-        else:
+        if not (isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()):
             skipped += 1
+            continue
 
-    message = f"形式が正しくないデータが {skipped} 件あったため、読み飛ばしました。" if skipped else None
-    return tasks, message
+        deadline = item.get("deadline")
+        if deadline is not None:
+            try:
+                date.fromisoformat(deadline)
+            except (TypeError, ValueError):
+                item["deadline"] = None
+                bad_deadline += 1
+        else:
+            item["deadline"] = None  # 古いデータ・期限なし
+        tasks.append(item)
+
+    messages = []
+    if skipped:
+        messages.append(f"形式が正しくないデータが {skipped} 件あったため、読み飛ばしました。")
+    if bad_deadline:
+        messages.append(f"期限が読み取れないタスクが {bad_deadline} 件あったため、「期限なし」にしました。")
+    return tasks, "\n".join(messages) or None
 
 
 def save_tasks(path, tasks):
@@ -105,19 +186,33 @@ class TodoApp:
         if warning:
             messagebox.showwarning("読み込みについて", warning, parent=self.root)
         self.refresh_list()
+        self.schedule_refresh()
 
     def build_widgets(self):
-        # --- 入力欄と追加ボタン ---
-        input_frame = tk.Frame(self.root, bg=BG_COLOR)
-        input_frame.pack(fill="x", padx=12, pady=12)
-
-        self.entry = tk.Entry(
-            input_frame, font=self.font, fg=TEXT_COLOR,
-            relief="solid", bd=1,
+        # --- 表の見た目（ttk の部品はスタイルで設定する） ---
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "Treeview", font=self.font, rowheight=int(FONT_SIZE * 2.4),
+            background=LIST_BG, fieldbackground=LIST_BG, foreground=TEXT_COLOR,
         )
+        style.configure("Treeview.Heading", font=self.small_font)
+        style.map("Treeview", background=[("selected", SELECT_COLOR)],
+                  foreground=[("selected", TEXT_COLOR)])
+
+        # --- 入力欄：タスク・期限・追加ボタン ---
+        input_frame = tk.Frame(self.root, bg=BG_COLOR)
+        input_frame.pack(fill="x", padx=12, pady=(12, 2))
+
+        self.entry = tk.Entry(input_frame, font=self.font, fg=TEXT_COLOR, relief="solid", bd=1)
         self.entry.pack(side="left", fill="x", expand=True, ipady=4)
         self.entry.bind("<Return>", lambda event: self.add_task())  # Enterキーでも追加
         self.entry.focus_set()
+
+        self.deadline_entry = tk.Entry(input_frame, font=self.font, fg=TEXT_COLOR,
+                                       relief="solid", bd=1, width=8)
+        self.deadline_entry.pack(side="left", padx=(6, 0), ipady=4)
+        self.deadline_entry.bind("<Return>", lambda event: self.add_task())
 
         tk.Button(
             input_frame, text="追加", command=self.add_task,
@@ -126,23 +221,32 @@ class TodoApp:
             relief="flat", padx=12, cursor="hand2",
         ).pack(side="left", padx=(8, 0), fill="y")
 
-        # --- タスク一覧（スクロールバー付き） ---
+        # 入力欄の説明
+        tk.Label(
+            self.root, text="右の欄に期限（例：10/31）。空欄なら期限なし",
+            font=(FONT_NAME, SMALL_FONT_SIZE - 1), fg="gray", bg=BG_COLOR, anchor="e",
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        # --- タスク一覧：「タスク｜期限」の表（スクロールバー付き） ---
         list_frame = tk.Frame(self.root, bg=BG_COLOR)
         list_frame.pack(fill="both", expand=True, padx=12)
 
-        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
         scrollbar.pack(side="right", fill="y")
 
-        self.listbox = tk.Listbox(
-            list_frame, yscrollcommand=scrollbar.set,
-            font=self.font, fg=TEXT_COLOR, bg=LIST_BG,
-            selectbackground=SELECT_COLOR, selectforeground=TEXT_COLOR,
-            relief="solid", bd=1, highlightthickness=0,
-            activestyle="none",
+        self.tree = ttk.Treeview(
+            list_frame, columns=("task", "deadline"), show="headings",
+            selectmode="browse", yscrollcommand=scrollbar.set,
         )
-        self.listbox.pack(side="left", fill="both", expand=True)
-        self.listbox.bind("<Delete>", lambda event: self.complete_task())  # Deleteキーでも完了
-        scrollbar.config(command=self.listbox.yview)
+        self.tree.heading("task", text="タスク", anchor="w")
+        self.tree.heading("deadline", text="期限")
+        self.tree.column("task", anchor="w", stretch=True, width=260)
+        self.tree.column("deadline", anchor="center", stretch=False, width=110)
+        self.tree.tag_configure("overdue", foreground=OVERDUE_COLOR)
+        self.tree.tag_configure("today", foreground=TODAY_COLOR)
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<Delete>", lambda event: self.complete_task())  # Deleteキーでも完了
+        scrollbar.config(command=self.tree.yview)
 
         # --- 下部：完了ボタンと最前面の切り替え ---
         bottom_frame = tk.Frame(self.root, bg=BG_COLOR)
@@ -163,17 +267,14 @@ class TodoApp:
         ).pack(side="right")
 
         # --- 件数表示 ---
-        self.status = tk.Label(
-            self.root, anchor="w", fg="gray",
-            font=self.small_font, bg=BG_COLOR,
-        )
+        self.status = tk.Label(self.root, anchor="w", fg="gray", font=self.small_font, bg=BG_COLOR)
         self.status.pack(fill="x", padx=12, pady=(0, 10))
 
     # ---- 操作 ----
     def add_task(self):
         text = self.entry.get().strip()
 
-        # 入力チェック
+        # タスクの入力チェック
         if not text:
             messagebox.showwarning("入力エラー", "タスクを入力してください。", parent=self.root)
             return
@@ -184,25 +285,42 @@ class TodoApp:
                 parent=self.root,
             )
             return
+
+        # 期限の入力チェック
+        deadline, error = parse_deadline(self.deadline_entry.get())
+        if error:
+            messagebox.showwarning("期限の入力エラー", error, parent=self.root)
+            self.deadline_entry.focus_set()
+            return
+        if deadline and deadline < date.today():
+            if not messagebox.askyesno(
+                "確認", f"期限（{deadline.month}/{deadline.day}）はもう過ぎています。\nこのまま登録しますか？",
+                parent=self.root,
+            ):
+                return
+
         if any(task["text"] == text for task in self.tasks):
             if not messagebox.askyesno("確認", f"「{text}」はすでにあります。\nそれでも追加しますか？", parent=self.root):
                 return
 
         self.tasks.append({
             "text": text,
+            "deadline": deadline.isoformat() if deadline else None,
             "created": datetime.now().isoformat(timespec="seconds"),
         })
         if self.save():
             self.entry.delete(0, tk.END)
+            self.deadline_entry.delete(0, tk.END)
+            self.entry.focus_set()
         self.refresh_list()
 
     def complete_task(self):
-        selected = self.listbox.curselection()
+        selected = self.tree.selection()
         if not selected:
             messagebox.showinfo("お知らせ", "完了したタスクを一覧から選んでください。", parent=self.root)
             return
 
-        index = selected[0]
+        index = int(selected[0])  # 行のIDに、並べ替え後の番号を入れてある
         removed = self.tasks.pop(index)
         if not self.save():
             self.tasks.insert(index, removed)  # 保存に失敗したら元に戻す
@@ -222,11 +340,36 @@ class TodoApp:
             return False
 
     def refresh_list(self):
-        """一覧を tasks の内容で描き直す"""
-        self.listbox.delete(0, tk.END)
-        for task in self.tasks:
-            self.listbox.insert(tk.END, "・" + task["text"])
-        self.status.config(text=f"残り {len(self.tasks)} 件")
+        """期限が近い順に並べ替えて、表を描き直す"""
+        self.tasks.sort(key=sort_key)
+        today = date.today().isoformat()
+
+        self.tree.delete(*self.tree.get_children())
+        overdue_count = 0
+        for i, task in enumerate(self.tasks):
+            deadline = task.get("deadline")
+            tags = ()
+            if deadline and deadline < today:
+                tags = ("overdue",)
+                overdue_count += 1
+            elif deadline == today:
+                tags = ("today",)
+            self.tree.insert("", "end", iid=str(i), tags=tags,
+                             values=(task["text"], format_deadline(deadline)))
+
+        status = f"残り {len(self.tasks)} 件"
+        if overdue_count:
+            status += f"（うち期限切れ {overdue_count} 件）"
+        self.status.config(text=status)
+
+    def schedule_refresh(self):
+        """
+        日付が変わったときに色分けが更新されるよう、1分ごとに描き直す。
+        （選んでいる行があるときは、操作の邪魔をしないよう描き直さない）
+        """
+        if not self.tree.selection():
+            self.refresh_list()
+        self.root.after(60_000, self.schedule_refresh)
 
 
 if __name__ == "__main__":
